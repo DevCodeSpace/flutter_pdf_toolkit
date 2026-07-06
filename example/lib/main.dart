@@ -32,7 +32,16 @@ class PdfProExampleApp extends StatelessWidget {
   }
 }
 
-enum DemoSourceKind { asset, network, bytes, base64, filePath, merge, split }
+enum DemoSourceKind {
+  asset,
+  network,
+  googleDrive,
+  bytes,
+  base64,
+  filePath,
+  merge,
+  split,
+}
 
 class PdfProExampleHome extends StatefulWidget {
   const PdfProExampleHome({super.key});
@@ -42,6 +51,9 @@ class PdfProExampleHome extends StatefulWidget {
 }
 
 class _PdfProExampleHomeState extends State<PdfProExampleHome> {
+  static const String _googleDrivePdfUrl =
+      'https://drive.google.com/file/d/1oPlPnK88iwL96GEF0_2kkR0S2DpN-oLT/view';
+
   final FlutterPdfToolkitController _controller = FlutterPdfToolkitController();
   DemoSourceKind _kind = DemoSourceKind.filePath;
   bool _darkMode = false;
@@ -466,6 +478,8 @@ class _PdfProExampleHomeState extends State<PdfProExampleHome> {
         return const PdfSource.network(
           'https://www.adobe.com/support/products/enterprise/knowledgecenter/media/c4611_sample_explain.pdf',
         );
+      case DemoSourceKind.googleDrive:
+        return const PdfSource.network(_googleDrivePdfUrl);
       case DemoSourceKind.bytes:
         return _networkBytes == null ? null : PdfSource.bytes(_networkBytes!);
       case DemoSourceKind.base64:
@@ -522,6 +536,12 @@ class _PdfProExampleHomeState extends State<PdfProExampleHome> {
                       setState(() => _kind = DemoSourceKind.network),
                 ),
                 ChoiceChip(
+                  label: const Text('Google Drive'),
+                  selected: _kind == DemoSourceKind.googleDrive,
+                  onSelected: (_) =>
+                      setState(() => _kind = DemoSourceKind.googleDrive),
+                ),
+                ChoiceChip(
                   label: const Text('Bytes'),
                   selected: _kind == DemoSourceKind.bytes,
                   onSelected: (_) =>
@@ -562,6 +582,7 @@ class _PdfProExampleHomeState extends State<PdfProExampleHome> {
               ],
             ),
           ),
+
           if (_kind == DemoSourceKind.split &&
               (_splitFilePaths?.length ?? 0) > 1)
             Padding(
