@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -16,6 +17,82 @@ void main() {
       (source as Base64PdfSource).bytes,
       Uint8List.fromList(utf8.encode('Hello')),
     );
+  });
+
+  test('normalizes Google Drive network PDF URLs', () {
+    final NetworkPdfSource driveSource =
+        const PdfSource.network(
+              'https://drive.google.com/file/d/1a2B3cD4e5F6g7H8I9J0/view?usp=sharing',
+            )
+            as NetworkPdfSource;
+    final NetworkPdfSource openSource =
+        const PdfSource.network(
+              'https://drive.google.com/open?id=1a2B3cD4e5F6g7H8I9J0',
+            )
+            as NetworkPdfSource;
+    final NetworkPdfSource ucSource =
+        const PdfSource.network(
+              'https://drive.google.com/uc?export=download&id=1a2B3cD4e5F6g7H8I9J0',
+            )
+            as NetworkPdfSource;
+
+    expect(
+      normalizeNetworkPdfUrl(Uri.parse(driveSource.url)),
+      Uri.https('drive.google.com', '/uc', {
+        'export': 'download',
+        'id': '1a2B3cD4e5F6g7H8I9J0',
+      }),
+    );
+
+    expect(
+      normalizeNetworkPdfUrl(Uri.parse(openSource.url)),
+      Uri.https('drive.google.com', '/uc', {
+        'export': 'download',
+        'id': '1a2B3cD4e5F6g7H8I9J0',
+      }),
+    );
+
+    expect(
+      normalizeNetworkPdfUrl(Uri.parse(ucSource.url)),
+      Uri.https('drive.google.com', '/uc', {
+        'export': 'download',
+        'id': '1a2B3cD4e5F6g7H8I9J0',
+      }),
+    );
+  });
+
+  test('network PDF downloads are cached by URL', () async {
+    final Directory tempDir = await Directory.systemTemp.createTemp(
+      'flutter_pdf_toolkit_test',
+    );
+    addTearDown(() async {
+      await tempDir.delete(recursive: true);
+      NetworkPdfSource.debugDownloadOverride = null;
+    });
+
+    int downloadCount = 0;
+    final Uint8List payload = Uint8List.fromList(
+      utf8.encode('%PDF-1.4\n%fake\n'),
+    );
+    final File file = File('${tempDir.path}/downloaded.pdf');
+    await file.writeAsBytes(payload, flush: true);
+
+    NetworkPdfSource.debugDownloadOverride =
+        (Uri uri, Map<String, String>? headers) async {
+          downloadCount++;
+          return file.path;
+        };
+
+    final PdfSource source = PdfSource.network(
+      'https://drive.google.com/file/d/1a2B3cD4e5F6g7H8I9J0/view?usp=sharing',
+    );
+
+    final String firstPath = await source.resolveToFile();
+    final String secondPath = await source.resolveToFile();
+
+    expect(firstPath, file.path);
+    expect(secondPath, file.path);
+    expect(downloadCount, 1);
   });
 
   group('FlutterPdfToolkit Static Methods', () {

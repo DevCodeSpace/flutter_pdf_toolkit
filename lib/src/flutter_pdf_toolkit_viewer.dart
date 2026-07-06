@@ -1229,6 +1229,7 @@ class _FlutterPdfToolkitState extends State<FlutterPdfToolkit> {
 
     final String? searchText = _controller.searchText;
     final bool hasSearchText = searchText != null && searchText.isNotEmpty;
+    final bool isSearching = _controller.isSearching;
 
     return Material(
       color: background,
@@ -1238,45 +1239,65 @@ class _FlutterPdfToolkitState extends State<FlutterPdfToolkit> {
         child: SizedBox(
           height: 60,
           child: hasSearchText
-              ? Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 12),
+              ? SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 0,
+                  ),
                   child: Row(
                     children: [
-                      Icon(
-                        Icons.search,
-                        color: foreground.withAlpha((0.7 * 255).round()),
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Text(
-                          'Results for "$searchText"',
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            color: foreground,
-                            fontWeight: FontWeight.bold,
+                      if (isSearching)
+                        Padding(
+                          padding: const EdgeInsets.only(right: 12),
+                          child: SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              color: foreground,
+                            ),
                           ),
+                        )
+                      else
+                        Icon(
+                          Icons.search,
+                          color: foreground.withAlpha((0.7 * 255).round()),
+                        ),
+                      const SizedBox(width: 8),
+                      Text(
+                        isSearching
+                            ? 'Searching for "$searchText"...'
+                            : 'Results for "$searchText"',
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: foreground,
+                          fontWeight: FontWeight.bold,
                         ),
                       ),
-                      if (_controller.searchResultCount > 0) ...[
-                        _ToolbarChip(
-                          label:
-                              '${_controller.currentSearchResultIndex}/${_controller.searchResultCount}',
-                          color: foreground,
-                        ),
-                        IconButton(
-                          tooltip: 'Previous result',
-                          color: foreground,
-                          onPressed: _controller.previousSearchResult,
-                          icon: const Icon(Icons.keyboard_arrow_left),
-                        ),
-                        IconButton(
-                          tooltip: 'Next result',
-                          color: foreground,
-                          onPressed: _controller.nextSearchResult,
-                          icon: const Icon(Icons.keyboard_arrow_right),
-                        ),
-                      ] else ...[
-                        _ToolbarChip(label: 'No results', color: foreground),
+                      const SizedBox(width: 12),
+                      if (!isSearching) ...[
+                        if (_controller.searchResultCount > 0) ...[
+                          _ToolbarChip(
+                            label:
+                                '${_controller.currentSearchResultIndex}/${_controller.searchResultCount}',
+                            color: foreground,
+                          ),
+                          IconButton(
+                            tooltip: 'Previous result',
+                            color: foreground,
+                            onPressed: _controller.previousSearchResult,
+                            icon: const Icon(Icons.keyboard_arrow_left),
+                          ),
+                          IconButton(
+                            tooltip: 'Next result',
+                            color: foreground,
+                            onPressed: _controller.nextSearchResult,
+                            icon: const Icon(Icons.keyboard_arrow_right),
+                          ),
+                        ] else ...[
+                          _ToolbarChip(label: 'No results', color: foreground),
+                        ],
                       ],
                       if (widget.showZoomControls) ...[
                         IconButton(
@@ -1349,12 +1370,26 @@ class _FlutterPdfToolkitState extends State<FlutterPdfToolkit> {
                         const SizedBox(width: 8),
                       ],
                       if (widget.showSearch)
-                        IconButton(
-                          tooltip: 'Search',
-                          color: foreground,
-                          onPressed: _showSearchDialog,
-                          icon: const Icon(Icons.search),
-                        ),
+                        isSearching
+                            ? IconButton(
+                                tooltip: 'Searching...',
+                                color: foreground,
+                                onPressed: null,
+                                icon: SizedBox(
+                                  width: 18,
+                                  height: 18,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                    color: foreground,
+                                  ),
+                                ),
+                              )
+                            : IconButton(
+                                tooltip: 'Search',
+                                color: foreground,
+                                onPressed: _showSearchDialog,
+                                icon: const Icon(Icons.search),
+                              ),
                       if (widget.showBookmarks)
                         IconButton(
                           tooltip: 'Bookmarks',
@@ -1642,10 +1677,64 @@ class _FlutterPdfToolkitState extends State<FlutterPdfToolkit> {
           );
         }
 
-        return Column(
+        return Stack(
           children: [
-            if (widget.showToolbar) _buildToolbar(context),
-            Expanded(child: _buildNativeView(snapshot.data!)),
+            Column(
+              children: [
+                if (widget.showToolbar) _buildToolbar(context),
+                Expanded(child: _buildNativeView(snapshot.data!)),
+              ],
+            ),
+            if (_controller.isSearching)
+              Positioned.fill(
+                child: Container(
+                  color: Colors.black.withAlpha((0.3 * 255).round()),
+                  child: Center(
+                    child: Container(
+                      padding: const EdgeInsets.all(24),
+                      decoration: BoxDecoration(
+                        color: Theme.of(context).colorScheme.surface,
+                        borderRadius: BorderRadius.circular(16),
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.black.withAlpha((0.2 * 255).round()),
+                            blurRadius: 8,
+                            spreadRadius: 2,
+                          ),
+                        ],
+                      ),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          CircularProgressIndicator(
+                            color: Theme.of(context).colorScheme.primary,
+                          ),
+                          const SizedBox(height: 16),
+                          Text(
+                            'Searching...',
+                            style: Theme.of(context).textTheme.titleMedium
+                                ?.copyWith(
+                                  color: Theme.of(
+                                    context,
+                                  ).colorScheme.onSurface,
+                                ),
+                          ),
+                          const SizedBox(height: 8),
+                          Text(
+                            'This may take a moment',
+                            style: Theme.of(context).textTheme.bodySmall
+                                ?.copyWith(
+                                  color: Theme.of(
+                                    context,
+                                  ).colorScheme.onSurfaceVariant,
+                                ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
           ],
         );
       },
