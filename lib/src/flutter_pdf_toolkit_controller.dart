@@ -20,6 +20,7 @@ class FlutterPdfToolkitController extends ChangeNotifier {
   int _currentSearchResultIndex = 0;
   List<PdfBookmarkItem> _bookmarks = const [];
   bool _isReady = false;
+  bool _isSearching = false;
   bool? _pendingDarkMode;
 
   Future<String?> Function(bool retry)? onPasswordRequired;
@@ -31,6 +32,7 @@ class FlutterPdfToolkitController extends ChangeNotifier {
   String? get searchText => _searchText;
   int get searchResultCount => _searchResultCount;
   int get currentSearchResultIndex => _currentSearchResultIndex;
+  bool get isSearching => _isSearching;
   List<PdfBookmarkItem> get bookmarks => _bookmarks;
   bool get isReady => _isReady;
   String? get errorMessage => _errorMessage;
@@ -68,6 +70,7 @@ class FlutterPdfToolkitController extends ChangeNotifier {
         _searchText = args['text'] as String?;
         _searchResultCount = (args['count'] as num?)?.toInt() ?? 0;
         _currentSearchResultIndex = (args['index'] as num?)?.toInt() ?? 0;
+        _isSearching = false;
         break;
       case 'onBookmarks':
         final List<dynamic> raw = call.arguments as List<dynamic>;
@@ -121,10 +124,26 @@ class FlutterPdfToolkitController extends ChangeNotifier {
   }
 
   Future<void> search(String text, {bool caseSensitive = false}) async {
-    await _channel?.invokeMethod('search', {
-      'text': text,
-      'caseSensitive': caseSensitive,
-    });
+    if (_channel == null) {
+      return;
+    }
+
+    _isSearching = true;
+    _searchText = text;
+    _searchResultCount = 0;
+    _currentSearchResultIndex = 0;
+    notifyListeners();
+
+    try {
+      await _channel!.invokeMethod('search', {
+        'text': text,
+        'caseSensitive': caseSensitive,
+      });
+    } catch (e) {
+      _isSearching = false;
+      notifyListeners();
+      rethrow;
+    }
   }
 
   Future<void> requestBookmarks() async {
@@ -132,6 +151,11 @@ class FlutterPdfToolkitController extends ChangeNotifier {
   }
 
   Future<void> clearSearch() async {
+    _isSearching = false;
+    _searchText = null;
+    _searchResultCount = 0;
+    _currentSearchResultIndex = 0;
+    notifyListeners();
     await _channel?.invokeMethod('clearSearch');
   }
 

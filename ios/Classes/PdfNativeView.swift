@@ -3,7 +3,7 @@ import PDFKit
 import UIKit
 import CoreImage
 
-final class PdfNativeView: NSObject, FlutterPlatformView, UIScrollViewDelegate {
+final class PdfNativeView: NSObject, FlutterPlatformView, UIScrollViewDelegate, UIGestureRecognizerDelegate {
   private let channel: FlutterMethodChannel
   private var document: PDFDocument?
   private let container = UIView()
@@ -16,7 +16,10 @@ final class PdfNativeView: NSObject, FlutterPlatformView, UIScrollViewDelegate {
 
   private var pageCount: Int = 0
   private var currentPage: Int = 1
+  private var previousPage: Int = 1
   private var zoom: CGFloat
+  private var suppressPageUpdates = false
+  private var pinchStartZoom: CGFloat = 1.0
   private let path: String
   private let password: String?
   private let initialPage: Int
@@ -49,7 +52,7 @@ final class PdfNativeView: NSObject, FlutterPlatformView, UIScrollViewDelegate {
     self.singlePage = creationParams?["singlePage"] as? Bool ?? false
     self.vertical = (creationParams?["scrollDirection"] as? String ?? "vertical") == "vertical"
     self.darkMode = creationParams?["darkMode"] as? Bool ?? false
-    self.zoom = CGFloat((creationParams?["initialZoomLevel"] as? Double) ?? 1.0)
+    self.zoom = max(CGFloat((creationParams?["initialZoomLevel"] as? Double) ?? 1.0), 1.0)
     super.init()
     channel.setMethodCallHandler(handleMethodCall(_:result:))
     setupScrollView()
@@ -62,19 +65,27 @@ final class PdfNativeView: NSObject, FlutterPlatformView, UIScrollViewDelegate {
 
   private func setupScrollView() {
     scrollView.delegate = self
-    scrollView.minimumZoomScale = 0.5
-    scrollView.maximumZoomScale = 4.0
     scrollView.showsVerticalScrollIndicator = true
     scrollView.showsHorizontalScrollIndicator = true
-    scrollView.bouncesZoom = true
     scrollView.translatesAutoresizingMaskIntoConstraints = false
+    scrollView.isScrollEnabled = true
+    scrollView.canCancelContentTouches = false
 
     container.addSubview(scrollView)
     scrollView.addSubview(pagesContainer)
 
     let doubleTapGesture = UITapGestureRecognizer(target: self, action: #selector(handleDoubleTap(_:)))
     doubleTapGesture.numberOfTapsRequired = 2
-    scrollView.addGestureRecognizer(doubleTapGesture)
+    doubleTapGesture.delegate = self
+    container.addGestureRecognizer(doubleTapGesture)
+
+    let pinchGesture = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
+    pinchGesture.delegate = self
+    container.addGestureRecognizer(pinchGesture)
+
+    // Keep scroll gestures, but disable the native pinch-to-zoom path so only the current page
+    // is resized through our manual layout updates.
+    scrollView.pinchGestureRecognizer?.isEnabled = false
 
     NSLayoutConstraint.activate([
       scrollView.topAnchor.constraint(equalTo: container.topAnchor),
@@ -88,31 +99,45 @@ final class PdfNativeView: NSObject, FlutterPlatformView, UIScrollViewDelegate {
 
   // MARK: - UIScrollViewDelegate
 
-  func viewForZooming(in scrollView: UIScrollView) -> UIView? { pagesContainer }
-
-  func scrollViewDidZoom(_ scrollView: UIScrollView) {
-    zoom = scrollView.zoomScale
-    channel.invokeMethod("onZoomChanged", arguments: Double(zoom))
-    centerPagesIfNeeded()
-  }
+  func viewForZooming(in scrollView: UIScrollView) -> UIView? { nil }
 
   func scrollViewDidScroll(_ scrollView: UIScrollView) {
+    guard !suppressPageUpdates else { return }
     updateCurrentPageFromScroll()
   }
 
+  private func applyZoom() {
+    let wasSuppressing = suppressPageUpdates
+    suppressPageUpdates = true
+    updatePageFramesForZoom()
+    centerPagesIfNeeded()
+    suppressPageUpdates = wasSuppressing
+    channel.invokeMethod("onZoomChanged", arguments: Double(zoom))
+  }
+
   @objc private func handleDoubleTap(_ gesture: UITapGestureRecognizer) {
-    if scrollView.zoomScale > scrollView.minimumZoomScale * 1.5 {
-      scrollView.setZoomScale(scrollView.minimumZoomScale, animated: true)
-    } else {
-      let point = gesture.location(in: pagesContainer)
-      let newScale = min(scrollView.zoomScale * 2, scrollView.maximumZoomScale)
-      let size = CGSize(
-        width: scrollView.bounds.width / newScale,
-        height: scrollView.bounds.height / newScale
-      )
-      let origin = CGPoint(x: point.x - size.width / 2, y: point.y - size.height / 2)
-      scrollView.zoom(to: CGRect(origin: origin, size: size), animated: true)
+    zoom = zoom > 1.5 ? 1.0 : min(zoom * 2, 4.0)
+    applyZoom()
+  }
+
+  @objc private func handlePinch(_ gesture: UIPinchGestureRecognizer) {
+    switch gesture.state {
+    case .began:
+      suppressPageUpdates = true
+      pinchStartZoom = zoom
+    case .changed:
+      zoom = max(1.0, min(pinchStartZoom * gesture.scale, 4.0))
+      applyZoom()
+    case .ended, .cancelled, .failed:
+      suppressPageUpdates = false
+      updateCurrentPageFromScroll()
+    default:
+      break
     }
+  }
+
+  func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+    true
   }
 
   private func centerPagesIfNeeded() {
@@ -128,11 +153,37 @@ final class PdfNativeView: NSObject, FlutterPlatformView, UIScrollViewDelegate {
     let midX = scrollView.contentOffset.x + scrollView.bounds.width / 2
     var closest = currentPage
     var minDist = CGFloat.greatestFiniteMagnitude
+
     for (pageNum, iv) in pageViews {
-      let dist = vertical ? abs(iv.frame.midY - midY) : abs(iv.frame.midX - midX)
-      if dist < minDist { minDist = dist; closest = pageNum }
+      let pageRect = iv.frame
+
+      if vertical {
+        let isPageInView = pageRect.minY < (scrollView.contentOffset.y + scrollView.bounds.height) &&
+                          pageRect.maxY > scrollView.contentOffset.y
+        if isPageInView {
+          let dist = abs(pageRect.midY - midY)
+          if dist < minDist { minDist = dist; closest = pageNum }
+        }
+      } else {
+        let isPageInView = pageRect.minX < (scrollView.contentOffset.x + scrollView.bounds.width) &&
+                          pageRect.maxX > scrollView.contentOffset.x
+        if isPageInView {
+          let dist = abs(pageRect.midX - midX)
+          if dist < minDist { minDist = dist; closest = pageNum }
+        }
+      }
     }
-    if closest != currentPage { currentPage = closest; sendPageChanged() }
+
+    if closest != currentPage {
+      // Reset zoom when changing pages
+      if zoom != 1.0 {
+        previousPage = currentPage
+        zoom = 1.0
+        applyZoom()
+      }
+      currentPage = closest
+      sendPageChanged()
+    }
   }
 
   // MARK: - Document Loading
@@ -189,11 +240,11 @@ final class PdfNativeView: NSObject, FlutterPlatformView, UIScrollViewDelegate {
     self.pageCount = doc.pageCount
     DispatchQueue.main.async {
       self.layoutPages()
+      self.currentPage = self.initialPage.clamped(1, self.pageCount)
+      self.applyZoom()
       self.sendBookmarks()
       self.channel.invokeMethod("onReady", arguments: nil)
       self.jumpToPageInternal(self.initialPage, animated: false)
-      self.sendPageChanged()
-      self.channel.invokeMethod("onZoomChanged", arguments: Double(self.zoom))
     }
   }
 
@@ -206,46 +257,100 @@ final class PdfNativeView: NSObject, FlutterPlatformView, UIScrollViewDelegate {
     invertedImages.removeAll()
     guard let document, pageCount > 0 else { return }
 
-    // Use the actual container width if available, otherwise fall back to screen width
     let viewportW = container.bounds.width > 0 ? container.bounds.width : UIScreen.main.bounds.width
-    let viewportH = container.bounds.height > 0 ? container.bounds.height : UIScreen.main.bounds.height
     let pagesToShow = singlePage ? [initialPage.clamped(1, pageCount)] : Array(1...pageCount)
+    let separatorThickness = 1.0 / UIScreen.main.scale
 
     var offset: CGFloat = pageSpacing
+    var maxWidth: CGFloat = viewportW
+
     for pageNum in pagesToShow {
       guard let page = document.page(at: pageNum - 1) else { continue }
       let bounds = page.bounds(for: .mediaBox)
       let ratio = bounds.width / bounds.height
 
-      let w: CGFloat
-      let h: CGFloat
-      if vertical {
-        w = viewportW - 32
-        h = w / ratio
-      } else {
-        h = viewportH - 32
-        w = h * ratio
-      }
+      // Base layout; zoom is applied by resizing only the current page later.
+      let w = viewportW - 32
+      let h = w / ratio
 
-      let frame: CGRect = vertical
-        ? CGRect(x: 16, y: offset, width: w, height: h)
-        : CGRect(x: offset, y: 16, width: w, height: h)
-      offset += (vertical ? h : w) + pageSpacing
+      let frame: CGRect = CGRect(x: 16, y: offset, width: w, height: h)
+      offset += h + pageSpacing
 
       let iv = UIImageView(frame: frame)
       iv.contentMode = .scaleAspectFit
       iv.backgroundColor = UIColor(hex: darkMode ? "#0F172A" : "#FFFFFF")
       pagesContainer.addSubview(iv)
       pageViews[pageNum] = iv
+
+      if pageNum != pagesToShow.last {
+        let separatorFrame = CGRect(
+          x: 16,
+          y: frame.maxY + (pageSpacing - separatorThickness) / 2,
+          width: w,
+          height: separatorThickness
+        )
+        let separator = UIView(frame: separatorFrame)
+        separator.backgroundColor = UIColor.separator
+        pagesContainer.addSubview(separator)
+      }
     }
 
-    let totalSize: CGSize = vertical
-      ? CGSize(width: viewportW, height: offset)
-      : CGSize(width: offset, height: viewportH)
+    let totalSize: CGSize = CGSize(width: viewportW, height: offset)
     pagesContainer.frame = CGRect(origin: .zero, size: totalSize)
     scrollView.contentSize = totalSize
 
     for pageNum in pagesToShow { renderPage(pageNum) }
+  }
+
+  private func updatePageFramesForZoom() {
+    guard let document, pageCount > 0 else { return }
+
+    let viewportW = container.bounds.width > 0 ? container.bounds.width : UIScreen.main.bounds.width
+    let pagesToShow = singlePage ? [initialPage.clamped(1, pageCount)] : Array(1...pageCount)
+    let separatorThickness = 1.0 / UIScreen.main.scale
+
+    var offset: CGFloat = pageSpacing
+    var subviewIndex = 0
+    var maxWidth: CGFloat = viewportW
+
+    for pageNum in pagesToShow {
+      guard let page = document.page(at: pageNum - 1) else { continue }
+      let bounds = page.bounds(for: .mediaBox)
+      let ratio = bounds.width / bounds.height
+
+      // Only zoom current page, others at base size
+      let pageZoom = (pageNum == currentPage) ? zoom : 1.0
+      let baseWidth = viewportW - 32
+      let w = baseWidth * pageZoom
+      let h = w / ratio
+      maxWidth = max(maxWidth, w + 32)
+
+      let frame: CGRect = CGRect(x: 16, y: offset, width: w, height: h)
+      offset += h + pageSpacing
+
+      if let iv = pagesContainer.subviews[safe: subviewIndex] as? UIImageView {
+        iv.frame = frame
+        pageViews[pageNum] = iv
+      }
+      subviewIndex += 1
+
+      if pageNum != pagesToShow.last {
+        let separatorFrame = CGRect(
+          x: 16,
+          y: frame.maxY + (pageSpacing - separatorThickness) / 2,
+          width: w,
+          height: separatorThickness
+        )
+        if let separator = pagesContainer.subviews[safe: subviewIndex] as? UIView, !(separator is UIImageView) {
+          separator.frame = separatorFrame
+        }
+        subviewIndex += 1
+      }
+    }
+
+    let totalSize: CGSize = CGSize(width: maxWidth, height: offset)
+    pagesContainer.frame = CGRect(origin: .zero, size: totalSize)
+    scrollView.contentSize = totalSize
   }
 
   // MARK: - Rendering
@@ -328,8 +433,12 @@ final class PdfNativeView: NSObject, FlutterPlatformView, UIScrollViewDelegate {
     let clamped = pageNumber.clamped(1, max(1, pageCount))
     currentPage = clamped
     guard let iv = pageViews[clamped] else { sendPageChanged(); return }
-    let rect = iv.frame.insetBy(dx: -pageSpacing, dy: -pageSpacing)
-    scrollView.scrollRectToVisible(rect, animated: animated)
+    
+    if vertical {
+      scrollView.setContentOffset(CGPoint(x: 0, y: iv.frame.minY - pageSpacing), animated: animated)
+    } else {
+      scrollView.setContentOffset(CGPoint(x: iv.frame.minX - pageSpacing, y: 0), animated: animated)
+    }
     sendPageChanged()
   }
 
@@ -483,14 +592,17 @@ final class PdfNativeView: NSObject, FlutterPlatformView, UIScrollViewDelegate {
       result(nil)
     case "zoomIn":
       let step = CGFloat(((call.arguments as? [String: Any])?["step"] as? Double) ?? 0.25)
-      scrollView.setZoomScale(min(zoom + step, 4.0), animated: true)
+      zoom = min(zoom + step, 4.0)
+      applyZoom()
       result(nil)
     case "zoomOut":
       let step = CGFloat(((call.arguments as? [String: Any])?["step"] as? Double) ?? 0.25)
-      scrollView.setZoomScale(max(zoom - step, 0.5), animated: true)
+      zoom = max(zoom - step, 1.0)
+      applyZoom()
       result(nil)
     case "resetZoom":
-      scrollView.setZoomScale(1.0, animated: true)
+      zoom = 1.0
+      applyZoom()
       result(nil)
     case "search":
       let text = (call.arguments as? [String: Any])?["text"] as? String ?? ""
@@ -581,6 +693,12 @@ final class PdfNativeView: NSObject, FlutterPlatformView, UIScrollViewDelegate {
 
 private extension Int {
   func clamped(_ lo: Int, _ hi: Int) -> Int { self < lo ? lo : (self > hi ? hi : self) }
+}
+
+private extension Array {
+  subscript(safe index: Int) -> Element? {
+    index >= 0 && index < count ? self[index] : nil
+  }
 }
 
 private extension UIColor {

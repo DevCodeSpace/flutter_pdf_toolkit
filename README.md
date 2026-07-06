@@ -202,6 +202,11 @@ const PdfSource.network(
   headers: {'Authorization': 'Bearer <token>'},
 );
 
+// From a Google Drive sharing URL
+const PdfSource.network(
+  'https://drive.google.com/file/d/1a2B3cD4e5F6g7H8I9J0/view?usp=sharing',
+);
+
 // From an absolute local file path
 const PdfSource.filePath('/storage/emulated/0/Download/sample.pdf');
 

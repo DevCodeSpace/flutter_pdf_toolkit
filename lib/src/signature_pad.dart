@@ -108,10 +108,14 @@ class SignaturePadState extends State<SignaturePad> {
       key: _boundaryKey,
       child: GestureDetector(
         behavior: HitTestBehavior.opaque,
-        onPanStart: (DragStartDetails details) =>
-            widget.controller.startStroke(details.localPosition),
-        onPanUpdate: (DragUpdateDetails details) =>
-            widget.controller.addPoint(details.localPosition),
+        onPanStart: (DragStartDetails details) {
+          final Offset p = _clampToBounds(details.localPosition);
+          widget.controller.startStroke(p);
+        },
+        onPanUpdate: (DragUpdateDetails details) {
+          final Offset p = _clampToBounds(details.localPosition);
+          widget.controller.addPoint(p);
+        },
         onPanEnd: (DragEndDetails details) => widget.controller.endStroke(),
         child: CustomPaint(
           painter: _SignaturePainter(
@@ -123,6 +127,14 @@ class SignaturePadState extends State<SignaturePad> {
         ),
       ),
     );
+  }
+
+  Offset _clampToBounds(Offset point) {
+    final Size? s = context.size;
+    if (s == null) return point;
+    final double x = point.dx.clamp(0.0, s.width);
+    final double y = point.dy.clamp(0.0, s.height);
+    return Offset(x, y);
   }
 }
 
@@ -139,6 +151,10 @@ class _SignaturePainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
+    // Ensure drawing is clipped to the pad's bounds so strokes outside
+    // the widget (when the pointer moves off the pad) aren't rendered.
+    canvas.save();
+    canvas.clipRect(Rect.fromLTWH(0, 0, size.width, size.height));
     final Paint paint = Paint()
       ..color = color
       ..strokeWidth = strokeWidth
@@ -164,6 +180,7 @@ class _SignaturePainter extends CustomPainter {
       }
       canvas.drawPath(path, paint);
     }
+    canvas.restore();
   }
 
   @override
