@@ -55,8 +55,18 @@ class PdfNativeView(
     // the bulk text-extraction work and appear with a delay after a search jump.
     private val highlightExecutor = Executors.newSingleThreadExecutor()
     private val root = FrameLayout(context)
-    private val verticalScroll = ScrollView(context)
-    private val horizontalScroll = HorizontalScrollView(context)
+    private val verticalScroll = object : ScrollView(context) {
+        override fun onScrollChanged(l: Int, t: Int, oldl: Int, oldt: Int) {
+            super.onScrollChanged(l, t, oldl, oldt)
+            updateCurrentPageFromScroll()
+        }
+    }
+    private val horizontalScroll = object : HorizontalScrollView(context) {
+        override fun onScrollChanged(l: Int, t: Int, oldl: Int, oldt: Int) {
+            super.onScrollChanged(l, t, oldl, oldt)
+            updateCurrentPageFromScroll()
+        }
+    }
     private val pagesContainer = LinearLayout(context)
     private val gestureDetector: GestureDetector
     private val scaleGestureDetector: ScaleGestureDetector
@@ -70,20 +80,28 @@ class PdfNativeView(
     private var decryptedFile: File? = null
     private var pageCount = 0
     private var currentPage = 1
-    private var zoom = (creationParams?.get("initialZoomLevel") as? Number)?.toFloat() ?: 1f
+    private var previousPage = 1
+    private var zoom = ((creationParams?.get("initialZoomLevel") as? Number)?.toFloat() ?: 1f).coerceAtLeast(1f)
     private var lastAppliedZoom = zoom
-    private var transientScale = 1f
     private var pinchFocusX = 0f
     private var pinchFocusY = 0f
+    // Latched for the duration of a pinch (from the second finger touching down until
+    // every finger lifts) so the underlying ScrollViews never treat the pinch centroid's
+    // movement — or the residual motion as fingers lift — as a scroll/fling.
+    private var isPinching = false
     private val singlePage = creationParams?.get("singlePage") as? Boolean ?: false
     private val vertical = (creationParams?.get("scrollDirection") as? String ?: "vertical") == "vertical"
     private val path = creationParams?.get("path") as String
     private var currentPassword = creationParams?.get("password") as? String ?: ""
     private var initialPage = (creationParams?.get("initialPage") as? Number)?.toInt() ?: 1
     private var darkMode = creationParams?.get("darkMode") as? Boolean ?: false
+    private val separatorThickness = (context.resources.displayMetrics.density + 0.5f).toInt()
     private var searchMatches = listOf<SearchMatch>()
     private var currentSearchMatchIndex = 0
     private var currentSearchText = ""
+    private var suppressPageUpdates = false
+    private var pinchAnchorX = 0f
+    private var pinchAnchorY = 0f
 
     // Keyed by page number (1-based). Populated on executor; read on executor (single-thread, no races).
     private val pageTextCache = mutableMapOf<Int, String>()
@@ -94,7 +112,7 @@ class PdfNativeView(
     init {
         PDFBoxResourceLoader.init(context)
         channel.setMethodCallHandler(this)
-        pagesContainer.orientation = if (vertical) LinearLayout.VERTICAL else LinearLayout.HORIZONTAL
+        pagesContainer.orientation = LinearLayout.VERTICAL
         pagesContainer.layoutParams = FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT,
             ViewGroup.LayoutParams.WRAP_CONTENT
@@ -103,8 +121,6 @@ class PdfNativeView(
         verticalScroll.isFillViewport = true
         horizontalScroll.isFillViewport = true
 
-        // Pivot at the origin so the transient pinch transform below scales/translates
-        // around the content's top-left, matching the scroll-position math in applyZoom.
         pagesContainer.pivotX = 0f
         pagesContainer.pivotY = 0f
 
@@ -124,58 +140,50 @@ class PdfNativeView(
         gestureDetector = GestureDetector(context, object : GestureDetector.SimpleOnGestureListener() {
             override fun onDoubleTap(e: MotionEvent): Boolean {
                 zoom = if (zoom < 1.5f) 2f else 1f
-                applyZoom(preserveScrollPosition = true)
+                applyZoom()
                 return true
             }
         })
         scaleGestureDetector = ScaleGestureDetector(context, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
             override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
-                transientScale = 1f
-                pagesContainer.translationX = 0f
-                pagesContainer.translationY = 0f
-                // Cache the container as a texture so the pinch transform below is GPU-composited
-                // instead of re-drawing every page bitmap on each frame.
-                pagesContainer.setLayerType(View.LAYER_TYPE_HARDWARE, null)
+                suppressPageUpdates = true
+                pinchAnchorX = detector.focusX
+                pinchAnchorY = detector.focusY
                 return true
             }
 
             override fun onScale(detector: ScaleGestureDetector): Boolean {
-                val newZoom = (zoom * detector.scaleFactor).coerceIn(0.5f, 4f)
-                val factor = if (zoom != 0f) newZoom / zoom else 1f
-                zoom = newZoom
-
-                pinchFocusX = detector.focusX
-                pinchFocusY = detector.focusY
-                val anchorX = pinchFocusX + horizontalScroll.scrollX
-                val anchorY = pinchFocusY + verticalScroll.scrollY
-
-                transientScale *= factor
-                pagesContainer.scaleX = transientScale
-                pagesContainer.scaleY = transientScale
-                pagesContainer.translationX = anchorX + (pagesContainer.translationX - anchorX) * factor
-                pagesContainer.translationY = anchorY + (pagesContainer.translationY - anchorY) * factor
+                if (detector.scaleFactor == 1f) return false
+                zoom = (zoom * detector.scaleFactor).coerceIn(1f, 4f)
+                applyZoom()
                 return true
             }
 
             override fun onScaleEnd(detector: ScaleGestureDetector) {
-                pagesContainer.setLayerType(View.LAYER_TYPE_NONE, null)
-                pagesContainer.scaleX = 1f
-                pagesContainer.scaleY = 1f
-                pagesContainer.translationX = 0f
-                pagesContainer.translationY = 0f
-                transientScale = 1f
-                applyZoom(preserveScrollPosition = true, anchorX = pinchFocusX, anchorY = pinchFocusY)
+                suppressPageUpdates = false
+                updateCurrentPageFromScroll()
             }
         })
 
         val touchListener = View.OnTouchListener { _, event ->
-            if (event.pointerCount > 1) {
+            if (event.actionMasked == MotionEvent.ACTION_POINTER_DOWN || event.pointerCount > 1) {
+                isPinching = true
                 verticalScroll.requestDisallowInterceptTouchEvent(true)
                 horizontalScroll.requestDisallowInterceptTouchEvent(true)
             }
+
             scaleGestureDetector.onTouchEvent(event)
-            gestureDetector.onTouchEvent(event)
-            event.pointerCount > 1 || scaleGestureDetector.isInProgress
+            if (!isPinching) {
+                gestureDetector.onTouchEvent(event)
+            }
+
+            val consumed = isPinching
+
+            when (event.actionMasked) {
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> isPinching = false
+            }
+
+            consumed
         }
         verticalScroll.setOnTouchListener(touchListener)
         horizontalScroll.setOnTouchListener(touchListener)
@@ -309,9 +317,11 @@ class PdfNativeView(
         } else {
             for (pageIndex in 0 until pageCount) {
                 pagesContainer.addView(createPageView(pageIndex + 1))
+                if (pageIndex < pageCount - 1) {
+                    pagesContainer.addView(createSeparatorView())
+                }
             }
         }
-        applyZoom(preserveScrollPosition = false)
         root.post { extractBookmarks() }
     }
 
@@ -320,9 +330,7 @@ class PdfNativeView(
         imageView.layoutParams = LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT,
             ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply {
-            setMargins(0, 0, 0, 24)
-        }
+        )
         imageView.adjustViewBounds = true
         imageView.scaleType = ImageView.ScaleType.FIT_XY
         applyImageTheme(imageView)
@@ -356,6 +364,27 @@ class PdfNativeView(
             // View was disposed concurrently and the executor already shut down; nothing to render.
         }
         return imageView
+    }
+
+    private fun createSeparatorView(): View {
+        val separator = View(context)
+        separator.setBackgroundColor(
+            if (darkMode) Color.parseColor("#334155") else Color.parseColor("#E5E7EB")
+        )
+        val gap = scaledSeparatorGap()
+        separator.layoutParams = LinearLayout.LayoutParams(
+            if (vertical) ViewGroup.LayoutParams.MATCH_PARENT else separatorThickness,
+            if (vertical) separatorThickness else ViewGroup.LayoutParams.MATCH_PARENT
+        ).apply {
+            if (vertical) {
+                topMargin = gap
+                bottomMargin = gap
+            } else {
+                leftMargin = gap
+                rightMargin = gap
+            }
+        }
+        return separator
     }
 
     private fun renderPage(index: Int): Bitmap {
@@ -420,60 +449,36 @@ class PdfNativeView(
 
     // ── Zoom ──────────────────────────────────────────────────────────────────
 
-    private fun applyZoom(preserveScrollPosition: Boolean = true, anchorX: Float? = null, anchorY: Float? = null) {
-        val previousZoom = lastAppliedZoom.takeIf { it > 0f } ?: zoom
-        val currentScrollX = horizontalScroll.scrollX
-        val currentScrollY = verticalScroll.scrollY
-        val viewportWidth = horizontalScroll.width
-        val viewportHeight = verticalScroll.height
-        val focusX = anchorX ?: (viewportWidth / 2f)
-        val focusY = anchorY ?: (viewportHeight / 2f)
+    private fun scaledPageGap(): Int = (24f * zoom).roundToInt().coerceAtLeast(0)
+    private fun scaledSeparatorGap(): Int = (12f * zoom).roundToInt().coerceAtLeast(0)
 
-        for (index in 0 until pagesContainer.childCount) {
-            (pagesContainer.getChildAt(index) as? ImageView)?.let { updatePageLayout(it) }
-        }
-
-        pagesContainer.requestLayout()
-
-        if (preserveScrollPosition) {
-            root.post {
-                val contentFocusY = (currentScrollY + focusY) / previousZoom
-                val targetScrollY = (contentFocusY * zoom - focusY).roundToInt().coerceAtLeast(0)
-                val contentFocusX = (currentScrollX + focusX) / previousZoom
-                val targetScrollX = (contentFocusX * zoom - focusX).roundToInt().coerceAtLeast(0)
-
-                verticalScroll.scrollTo(0, targetScrollY)
-                horizontalScroll.scrollTo(targetScrollX, 0)
-            }
-        }
-
+    private fun applyZoom() {
         lastAppliedZoom = zoom
+
+        for ((pageNum, imageView) in pageImageViews) {
+            // Only zoom current page, others stay at zoom 1.0
+            val pageZoom = if (pageNum == currentPage) zoom else 1f
+            updatePageLayout(imageView, pageZoom)
+        }
+
         channel.invokeMethod("onZoomChanged", zoom.toDouble())
     }
 
-    private fun updatePageLayout(imageView: ImageView) {
+    private fun updatePageLayout(imageView: ImageView, pageZoom: Float = 1f) {
         val pageSize = imageView.tag as? PageSize ?: return
         val layoutParams = (imageView.layoutParams as? LinearLayout.LayoutParams)
             ?: LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
         val viewportWidth = horizontalScroll.width.takeIf { it > 0 } ?: root.width
-        val viewportHeight = verticalScroll.height.takeIf { it > 0 } ?: root.height
         val aspectRatio = pageSize.width.toFloat() / pageSize.height.toFloat()
 
-        if (vertical) {
-            val baseWidth = viewportWidth.takeIf { it > 0 } ?: pageSize.width
-            val width = (baseWidth * zoom).roundToInt().coerceAtLeast(1)
-            val height = (width / aspectRatio).roundToInt().coerceAtLeast(1)
-            layoutParams.width = width
-            layoutParams.height = height
-        } else {
-            val baseHeight = viewportHeight.takeIf { it > 0 } ?: pageSize.height
-            val height = (baseHeight * zoom).roundToInt().coerceAtLeast(1)
-            val width = (height * aspectRatio).roundToInt().coerceAtLeast(1)
-            layoutParams.width = width
-            layoutParams.height = height
-        }
+        val baseWidth = (viewportWidth.toFloat() - 32f).coerceAtLeast(1f)
+        val width = (baseWidth * pageZoom).toInt().coerceAtLeast(1)
+        val height = (width / aspectRatio).toInt().coerceAtLeast(1)
+        layoutParams.width = width
+        layoutParams.height = height
 
-        layoutParams.setMargins(0, 0, 0, 24)
+        val gap = (24f * pageZoom).roundToInt().coerceAtLeast(0)
+        layoutParams.setMargins(0, 0, 0, gap)
         imageView.layoutParams = layoutParams
     }
 
@@ -623,13 +628,53 @@ class PdfNativeView(
 
     private fun jumpToPageInternal(pageNumber: Int) {
         currentPage = pageNumber.coerceIn(1, pageCount.coerceAtLeast(1))
-        val targetView = pagesContainer.getChildAt(currentPage - 1) ?: return
+        val childIndex = if (singlePage) {
+            0
+        } else {
+            (currentPage - 1) * 2
+        }
+        val targetView = pagesContainer.getChildAt(childIndex) ?: return
         root.post {
-            if (vertical) {
-                verticalScroll.scrollTo(0, targetView.top)
-            } else {
-                horizontalScroll.scrollTo(targetView.left, 0)
+            verticalScroll.scrollTo(0, targetView.top)
+            sendPageChanged()
+        }
+    }
+
+    private fun updateCurrentPageFromScroll() {
+        if (pageCount <= 0 || suppressPageUpdates) return
+
+        val scrollY = verticalScroll.scrollY
+        val viewHeight = verticalScroll.height
+        val midY = scrollY + viewHeight / 2
+        var closest = currentPage
+        var minDist = Double.MAX_VALUE
+
+        for ((pageNumber, imageView) in pageImageViews) {
+            if (!imageView.isShown) continue
+
+            val pageTop = imageView.top
+            val pageBottom = imageView.bottom
+
+            // Check if page is visible in viewport
+            val isInView = pageTop < (scrollY + viewHeight) && pageBottom > scrollY
+            if (!isInView) continue
+
+            val center = pageTop + imageView.height / 2
+            val dist = kotlin.math.abs(center - midY).toDouble()
+            if (dist < minDist) {
+                minDist = dist
+                closest = pageNumber
             }
+        }
+
+        if (closest != currentPage) {
+            // Reset zoom when changing pages
+            if (zoom != 1f) {
+                previousPage = currentPage
+                zoom = 1f
+                applyZoom()
+            }
+            currentPage = closest
             sendPageChanged()
         }
     }
@@ -780,7 +825,7 @@ class PdfNativeView(
                 result.success(null)
             }
             "zoomOut" -> {
-                zoom = (zoom - ((call.argument<Double>("step") ?: 0.25).toFloat())).coerceAtLeast(0.5f)
+                zoom = (zoom - ((call.argument<Double>("step") ?: 0.25).toFloat())).coerceAtLeast(1f)
                 applyZoom()
                 result.success(null)
             }

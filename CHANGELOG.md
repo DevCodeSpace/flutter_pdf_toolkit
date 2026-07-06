@@ -1,3 +1,16 @@
+## 0.0.2
+
+- **Network PDF Loading**: Normalize PDF sources, support Google Drive sharing URLs, and cache downloads for reuse.
+- **Search Enhancements**: Add loading indicator, horizontal scrolling, "Searching..." text, and dimmed overlay during search.
+- **Search State**: Track and cleanly reset search state in controller.
+- **Zoom & Navigation**: Reset zoom to 1.0 on page changes. Improve page detection and preserve scroll during zoom.
+- **Gestures**: Refine double-tap and pinch zoom on Android/iOS. Fix Android scroll/page updates during pinch.
+- **Signature Pad**: Clamp drawing to canvas bounds and clip exported strokes correctly.
+- **iOS Security**: Add NSAppTransportSecurity for Google Drive PDF downloads.
+- **Network Improvements**: Better error handling, debug logging, Google Drive confirmation retry mechanism.
+- **API Cleanup**: Simplify Dart API surface and widget implementations.
+- **Tests & Docs**: Expand tests for URL normalization and caching.
+
 ## 0.0.1
 
 - TODO: Describe initial release.
